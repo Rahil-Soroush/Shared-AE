@@ -7,6 +7,8 @@ from multi_loss import SupConLoss, csLoss
 from util import AverageMeter, save_model, TwoDropTransform_twomodal
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 
 # === Custom Dataset ===
 class GpiStnDataset(Dataset):
@@ -27,11 +29,21 @@ class GpiStnDataset(Dataset):
         return gpi_sample, stn_sample
 
 # === Training Function ===
-def train(loader, model_gpi, model_stn, model_decoder, mse_criterion, optimizer,
-          optimizer_gpi, optimizer_stn, epoch, device):
+def train(loader, model_gpi, model_stn, model_decoder, mse_criterion,cs_criterion, optimizer,
+          optimizer_gpi, optimizer_stn, epoch, device, writer):
     model_gpi.train()
     model_stn.train()
     model_decoder.train()
+
+    total_loss_epoch = 0
+    total_loss1 = 0
+    total_loss2 = 0
+    total_loss3 = 0
+    total_loss4 = 0
+    total_loss5 = 0
+    total_loss6 = 0
+    n_batches = 0
+
 
     for batch_idx, (gpi, stn) in enumerate(loader):
         gpi = gpi.to(device).float()
@@ -44,27 +56,71 @@ def train(loader, model_gpi, model_stn, model_decoder, mse_criterion, optimizer,
         features_gpi = model_gpi(gpi)
         features_stn = model_stn(stn)
 
-        _, _, gpi_pred, stn_pred, _, _ = model_decoder(features_gpi, features_stn)
+        shared_gpi,shared_stn, gpi_pred, stn_pred, gpi_prv, stn_prv = model_decoder(features_gpi, features_stn)
 
-        assert gpi_pred.shape == gpi.shape, "Shape mismatch in GPi reconstruction"
-        assert stn_pred.shape == stn.shape, "Shape mismatch in STN reconstruction"
+        loss1 = mse_criterion(gpi_pred, gpi)
+        loss2 = mse_criterion(stn_pred, stn)
+        loss3=cs_criterion(shared_gpi,shared_stn)
+        loss4=cs_criterion(gpi_prv,stn_prv) #inverse
+        loss5=cs_criterion(shared_gpi,gpi_prv) #inverse
+        loss6=cs_criterion(shared_stn,stn_prv) #inverse
 
-        loss = mse_criterion(gpi_pred, gpi) + mse_criterion(stn_pred, stn)
-        # loss = mse_criterion(stn_pred, stn)
+        # Final loss with weights
+        weight3 = 1.0      # shared/shared alignment
+        weight4 = 0.05     # private/private
+        weight5 = 0.05     # shared/private
 
+        loss = (
+            loss1 * gpi.shape[1] * gpi.shape[2] +   # N_channels * T
+            loss2 * stn.shape[1] * stn.shape[2] +
+            weight3 * loss3 +
+            weight4 / loss4 +
+            weight5 / loss5 +
+            weight5 / loss6
+        )
+        total_loss_epoch += loss.item()
+        total_loss1 += loss1.item()
+        total_loss2 += loss2.item()
+        total_loss3 += loss3.item()
+        total_loss4 += loss4.item()
+        total_loss5 += loss5.item()
+        total_loss6 += loss6.item()
+        n_batches += 1
+
+        
         loss.backward()
         optimizer.step()
         optimizer_gpi.step()
         optimizer_stn.step()
 
+        # # Log each loss component to TensorBoard
+        # step = epoch * len(loader) + batch_idx
+        # writer.add_scalar("Loss/total", loss.item(), step)
+        # writer.add_scalar("Loss/recon_gpi", loss1.item(), step)
+        # writer.add_scalar("Loss/recon_stn", loss2.item(), step)
+        # writer.add_scalar("Loss/shared_cs", loss3.item(), step)
+        # writer.add_scalar("Loss/private_private_inv_cs", loss4.item(), step)
+        # writer.add_scalar("Loss/shared_gpi_private_inv_cs", loss5.item(), step)
+        # writer.add_scalar("Loss/shared_stn_private_inv_cs", loss6.item(), step)
+
         if batch_idx % 10 == 0:
             print(f"  Batch {batch_idx}, Loss: {loss.item():.4f}")
+
+    writer.add_scalar("Loss/total", total_loss_epoch / n_batches, epoch)
+    writer.add_scalar("Loss/recon_gpi", total_loss1 / n_batches, epoch)
+    writer.add_scalar("Loss/recon_stn", total_loss2 / n_batches, epoch)
+    writer.add_scalar("Loss/shared_cs", total_loss3 / n_batches, epoch)
+    writer.add_scalar("Loss/private_inv_cs", total_loss4 / n_batches, epoch)
+    writer.add_scalar("Loss/gpi_sh_p_inv_cs", total_loss5 / n_batches, epoch)
+    writer.add_scalar("Loss/stn_sh_p_inv_cs", total_loss6 / n_batches, epoch)
+
 
 # === Main Script ===
 def main():
     subject_list = ["s508", "s514", "s515", "s517", "s519", "s520", "s521", "s523"]
     data_save_dir = r"F:\comp_project\Off_tensor_Data_R"
     model_save_dir = r"F:\comp_project\shared_ae_models"
+    writer = SummaryWriter(log_dir=f"runs/sharedae_exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     for subj in subject_list:
@@ -98,26 +154,29 @@ def main():
             embedding_dim=8, # from encoder output
             channels=newW, # time dimension
             bottleneck_dim=8, # smaller internal representation
-            image_latent_dim=3, #shared_GPi latent
-            neural_latent_dim=3, #shared STN latent
+            image_latent_dim=4, #shared_GPi latent
+            neural_latent_dim=4, #shared STN latent
             image_dim=gpi.shape[1], #GPi output channels
             neural_dim=stn.shape[1], #STN output channels
-            image_private_dim=5, # GPi private
-            neural_private_dim=5 #STN private
+            image_private_dim=4, # GPi private
+            neural_private_dim=4 #STN private
         ).to(device)
 
         # Define losses and optimizers
         mse_criterion = nn.MSELoss().to(device)
+        cs_criterion=csLoss(15).to(device)
+
         optimizer_gpi = optim.Adam(model_gpi.parameters(), lr=1e-4)
         optimizer_stn = optim.Adam(model_stn.parameters(), lr=1e-4)
         optimizer_decoder = optim.Adam(model_decoder.parameters(), lr=1e-4)
 
         # Train
-        for epoch in range(1, 101):
+        for epoch in range(1, 201):
             print(f"📚 Epoch {epoch}")
-            train(loader, model_gpi, model_stn, model_decoder, mse_criterion,
-                  optimizer_decoder, optimizer_gpi, optimizer_stn, epoch, device)
+            train(loader, model_gpi, model_stn, model_decoder, mse_criterion,cs_criterion,
+                  optimizer_decoder, optimizer_gpi, optimizer_stn, epoch, device, writer)
 
+        writer.close()
         # Save
         save_dir_model = os.path.join(model_save_dir, subj)
         os.makedirs(save_dir_model, exist_ok=True)

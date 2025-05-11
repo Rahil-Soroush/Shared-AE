@@ -26,3 +26,4 @@ build/
 
 # Ignore personal notebooks or experiment logs (optional)
 *.ipynb
+runs/
