@@ -1,343 +1,131 @@
 import os
-import sys
-
 import torch
+from torch.utils.data import Dataset, DataLoader
+from model_1d import SupConClipResNet1d
+from modeldecodeorth1 import Decoder, Decoder_dualNeuro
+from multi_loss import SupConLoss, csLoss
+from util import AverageMeter, save_model, TwoDropTransform_twomodal
 import torch.nn as nn
 import torch.optim as optim
 
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from torch.utils.data import Dataset, DataLoader
-import torch.backends.cudnn as cudnn
+# === Custom Dataset ===
+class GpiStnDataset(Dataset):
+    def __init__(self, gpi_tensor, stn_tensor, transform=None):
+        assert gpi_tensor.shape[0] == stn_tensor.shape[0], "Mismatch in sample count"
+        self.gpi = gpi_tensor
+        self.stn = stn_tensor
+        self.transform = transform
 
-from collections import deque
-# Ignore warnings
-import warnings
-warnings.filterwarnings("ignore")
-import h5py
-import random
-from data import pose_neural_Dataset
-from multi_loss import SupConLoss,csLoss
-from model_1d import SupConClipResNet1d
-from modeldecodeorth1 import Decoder
-from util import  AverageMeter,save_model,warmup_learning_rate,adjust_learning_rate,TwoDropTransform_twomodal
-import time 
-from sklearn.utils import shuffle
+    def __len__(self):
+        return self.gpi.shape[0]
 
+    def __getitem__(self, idx):
+        gpi_sample = self.gpi[idx]
+        stn_sample = self.stn[idx]
+        if self.transform:
+            return self.transform(gpi_sample, stn_sample)
+        return gpi_sample, stn_sample
 
-jobid=os.getenv('SLURM_ARRAY_TASK_ID')
-
-jobid=int(jobid)
-param={i:[] for i in range(2)}
-# param[10]=['image',256,1,0.07,30,5,5]#####weight:5, 3
-
-param[0]=['image',256,1,0.07,30,50,5,30,30,30,30]#####weight:5, 3
-
-weight1=param[jobid][7]
-weight2=param[jobid][8]
-weight3=param[jobid][9]
-weight4=param[jobid][10]
-
-dims=param[jobid][5]
-KS=param[jobid][6]
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if param[jobid][2]==1:
-    torch.manual_seed(1)
-else:
-    torch.manual_seed(2)
-
-# path='/blue/npadillacoreano/yidaiyao/calms21/'
-modelpath='path/to/data/'#'/gpfs/radev/project/saxena/dy274/headfixed/'
-W=9
-# hdf5_file ='zs_td_resize_seq_mouse_30_window_9_516session.hdf5'#'seq_mouse_30_window_9.hdf5'
-# hdf5_file=modelpath+'mnist25more.hdf5'
-# hdf5_file=modelpath+'mnist25more_resize_sine.hdf5'
-# hdf5_file=modelpath+'mnist_all_more_resize_sine.hdf5'
-hdf5_file='path/to/pose.hdf5'#modelpath+'posedata1d.hdf5'
-data1 = h5py.File(hdf5_file, 'r')
-hdf5_file='path/to/neural.hdf5'
-data2 = h5py.File(hdf5_file, 'r')
-
-# data.keys()
-arg=1
-alllabels=deque()
-# alllabels=list(data1['pose'].keys())
-NN=388
-# trainidx=np.load('trainidx.npy')
-for tt in range(100):
-    for ww in range (189-W):
-        alllabels.append(str(tt)+'_'+str(ww))
-for tt in range(516-288,516):
-    for ww in range (189-W):
-        alllabels.append(str(tt)+'_'+str(ww))
-        
-alllabels=alllabels*arg
-drop=2
-newW=W-drop
-batch_size=param[jobid][1]
-temperature=param[jobid][3]#0.07
-# flag='models/new_all_noweight_temperature_'+str(temperature)+'randomseed_'+str(param[jobid][2])+'weight_'+str(weight)+'dim_'+str(dims)+'_KS_'+str(dims)
-flag='models/nofusion_'+str(temperature)+'randomseed_'+str(param[jobid][2])+'dim_'+str(dims)+'_KS_'+str(dims)+'weight1_'+str(weight1)+'weight2_'+str(weight2)+'weight3_'+str(weight3)+'weight4_'+str(weight4)
-if_label=False
-######setup label####
-# GN=47
-# label=np.zeros((95))
-# v=95//GN
-
-# for j in range (GN):
-#     label[v*j:v*(j+1)]=np.ones((len(label[v*j:v*(j+1)])))*j
-    
-# label[-1]=47
-####################
-
-dataset=pose_neural_Dataset(alllabels,data1,data2,TwoDropTransform_twomodal(W,newW))
-
-    
-    
-loader = DataLoader(
-    dataset,
-    batch_size=batch_size,
-    shuffle=True
-)
-
-
-def set_model(model,temperature,flag):    
-    criterion = SupConLoss(temperature=temperature)
-
-    # enable synchronized Batch Normalization
-
-
-    if torch.cuda.is_available():
-        if torch.cuda.device_count() > 1:
-            model = torch.nn.DataParallel(model)
-
-                
-        model = model.to(device)
-        criterion = criterion.to(device)
-        cudnn.benchmark = True
-
-    return model, criterion
-image_private_dim,neural_private_dim=dims,dims
-
-embedding_dim, channels,bottleneck_dim,image_latent_dim,neural_latent_dim=512,newW,dims+image_private_dim,dims,dims
-neural_dim=np.array(data2['neural'][alllabels[0]]).shape[-1]
-pose_dim=7#np.array(data1['pose'][alllabels[0]]).shape[-1]
-
-
-model_image=SupConClipResNet1d(in_channel=newW,name1='resnet18', name2='neural_resnet18',flag='pose')
-model_neural=SupConClipResNet1d(in_channel=newW,name1='resnet18', name2='neural_resnet18',flag='neural')
-
-# model_decoder=Decoder(embedding_dim, channels,bottleneck_dim,image_latent_dim,neural_latent_dim,neural_dim,image_private_dim,neural_private_dim,pose_dim)
-model_decoder=Decoder(embedding_dim, channels,bottleneck_dim,image_latent_dim,neural_latent_dim,neural_dim,image_private_dim,neural_private_dim,pose_dim)
-
-
-
-optimizer_image = optim.Adam(model_image.parameters(), lr=1e-4)
-optimizer_neural = optim.Adam(model_neural.parameters(), lr=1e-4)
-optimizer = optim.Adam(model_decoder.parameters(), lr=1e-4)
-
-
-model_image,_=set_model(model_image,temperature,'image')
-model_neural, criterion=set_model(model_neural,temperature,'neural')
-model_decoder, _=set_model(model_decoder,temperature,'decoder')
-
-
-mse_criterion=nn.MSELoss()
-mse_criterion = mse_criterion.to(device)
-
-
-cs_criterion=csLoss(15)
-cs_criterion = cs_criterion.to(device)
-
-epochs=500
-save_freq=50
-save_folder1=flag+'/pose_enocder_'+str(batch_size)+'_'+str(param[jobid][2])+'_'+str(temperature)+'_model/'
-os.makedirs(save_folder1, exist_ok=True)
-save_folder2=flag+'/neural_encoder_'+str(batch_size)+'_'+str(param[jobid][2])+'_'+str(temperature)+'_model/'
-os.makedirs(save_folder2, exist_ok=True)
-save_folderdecoder=flag+'/decoder_'+str(batch_size)+'_'+str(param[jobid][2])+'_'+str(temperature)+'_model/'
-os.makedirs(save_folderdecoder, exist_ok=True)
-
-warm_epochs,warmup_from,warmup_to=30,1e-2,1e-3
-warm=False
-fff=True
-ccc=True
-
-def train(loader, model_image,model_neural, model_decoder,mse_criterion, optimizer,epoch,epochs,warm,warm_epochs,warmup_from,warmup_to,optimizer_image,optimizer_neural,learning_rate=1e-4,cosine=True,lr_decay_rate=1e-7,print_freq=50):
-
-
+# === Training Function ===
+def train(loader, model_gpi, model_stn, model_decoder, mse_criterion, optimizer,
+          optimizer_gpi, optimizer_stn, epoch, device):
+    model_gpi.train()
+    model_stn.train()
     model_decoder.train()
-    model_image.train()
-    model_neural.train()
-    
-    losses = AverageMeter()
-    cslosses = AverageMeter()
-    cslosses2 = AverageMeter()
-    cslosses3 = AverageMeter()
-    cslosses4 = AverageMeter()
-    
-    
-    
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    
-    end = time.time()
-    label=None
 
-    for batch_idx, (data) in enumerate(loader):###same image with different argumentation 
-        
-        # adjust_learning_rate(learning_rate,cosine, optimizer_image, epoch,epochs,lr_decay_rate)
-        # adjust_learning_rate(learning_rate,cosine, optimizer_neural, epoch,epochs,lr_decay_rate)
-        
+    for batch_idx, (gpi, stn) in enumerate(loader):
+        gpi = gpi.to(device).float()
+        stn = stn.to(device).float()
 
         optimizer.zero_grad()
-        optimizer_image.zero_grad()
-        optimizer_neural.zero_grad()
-        
-        
-        data_time.update(time.time() - end)
-        images=data[0]
-        neural=data[1]
-        
-        images=images.to(device).float()
-        neural=neural.to(device).float()
-        
-        features_image = model_image(images)
-        features_neural = model_neural(neural)
-        
+        optimizer_gpi.zero_grad()
+        optimizer_stn.zero_grad()
 
-        global_latent,image_feature,neural_feature,image_pred,neural_pred,image_previate,neural_previate=model_decoder(features_image,features_neural)
-        
-        bs=images.shape[0]
+        features_gpi = model_gpi(gpi)
+        features_stn = model_stn(stn)
 
-        # features1 = torch.cat([features_image.unsqueeze(1), features_neural.unsqueeze(1)], dim=1)
-        # features2 = torch.cat([features_neural.unsqueeze(1), features_image.unsqueeze(1)], dim=1)
-        loss1=mse_criterion(image_pred,images)
-        # print(neural.shape,neural_pred.shape)
-        # loss2=mse_criterion(neural_pred[:,-6:],neural[:,-6:])
-        loss2=mse_criterion(neural_pred[:,:],neural[:,:])
-        
-        loss3=cs_criterion(image_feature,neural_feature)
-        if ccc and fff:
-            loss5=cs_criterion(image_feature,image_previate)
-            cslosses3.update(loss5.item(), bs)
-            
-            loss6=cs_criterion(neural_feature,neural_previate)
-            cslosses4.update(loss6.item(), bs)
-            
-            loss4=cs_criterion(image_previate,neural_previate)
-            cslosses2.update(loss4.item(), bs)
-            
-            loss=loss1*pose_dim*newW+loss2*neural_dim*newW+loss3*weight1+weight2/loss4+weight3/loss5+weight4/loss6
-        #######################################
-        elif fff and not ccc:
-            loss4=cs_criterion(image_previate,neural_previate)
-            cslosses2.update(loss4.item(), bs)
-            # loss=loss1*28*28*newW+loss2*neural_dim*newW+loss3*weight+weight/loss4+weight/loss5+weight/loss6
-            
-            loss=loss1*pose_dim*newW+loss2*neural_dim*newW+loss3*weight+weight/loss4
-            # loss=loss1*28*28*newW+loss2*neural_dim*newW+1/loss3+loss4
-        
-        else:
-            loss=loss1*pose_dim*newW+loss2*neural_dim*newW+loss3
-            
-        losses.update(loss.item(), bs)
-        cslosses.update(loss3.item(), bs)
-        
-        
+        _, _, gpi_pred, stn_pred, _, _ = model_decoder(features_gpi, features_stn)
+
+        assert gpi_pred.shape == gpi.shape, "Shape mismatch in GPi reconstruction"
+        assert stn_pred.shape == stn.shape, "Shape mismatch in STN reconstruction"
+
+        loss = mse_criterion(gpi_pred, gpi) + mse_criterion(stn_pred, stn)
+        # loss = mse_criterion(stn_pred, stn)
 
         loss.backward()
         optimizer.step()
-        optimizer_image.step()
-        optimizer_neural.step()
+        optimizer_gpi.step()
+        optimizer_stn.step()
 
-        
-        batch_time.update(time.time() - end)
-        end = time.time()
-        
-        
-        ###print
-        if fff and not ccc:
-            if (batch_idx + 1) % print_freq == 0:
-                print('Train: [{0}][{1}/{2}]\t'
-                      'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                      'loss {loss.val:.3f} ({loss.avg:.3f})'
-                      'csloss {csloss.val:.3f} ({csloss.avg:.3f})'
-                      'csloss2 {csloss2.val:.3f} ({csloss2.avg:.3f})'.format(
-                       epoch, batch_idx + 1, len(loader), batch_time=batch_time,
-                       data_time=data_time, loss=losses,csloss=cslosses,csloss2=cslosses2))
-                sys.stdout.flush()
-        elif ccc and fff:
-            if (batch_idx + 1) % print_freq == 0:
-                print('Train: [{0}][{1}/{2}]\t'
-                      'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                      'loss {loss.val:.3f} ({loss.avg:.3f})'
-                      'csloss {csloss.val:.3f} ({csloss.avg:.3f})'
-                      'csloss2 {csloss2.val:.3f} ({csloss2.avg:.3f})'
-                      'csloss3 {csloss3.val:.3f} ({csloss3.avg:.3f})'
-                      'csloss4 {csloss4.val:.3f} ({csloss4.avg:.3f})'.format(
-                       epoch, batch_idx + 1, len(loader), batch_time=batch_time,
-                       data_time=data_time, loss=losses,csloss=cslosses,csloss2=cslosses2,csloss3=cslosses3,csloss4=cslosses4))
-                sys.stdout.flush()
-        else:
-            if (batch_idx + 1) % print_freq == 0:
-                    print('Train: [{0}][{1}/{2}]\t'
-                          'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                          'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                          'loss {loss.val:.3f} ({loss.avg:.3f})'
-                          'csloss {csloss.val:.3f} ({csloss.avg:.3f})'.format(
-                           epoch, batch_idx + 1, len(loader), batch_time=batch_time,
-                           data_time=data_time, loss=losses,csloss=cslosses))
-                    sys.stdout.flush()
+        if batch_idx % 10 == 0:
+            print(f"  Batch {batch_idx}, Loss: {loss.item():.4f}")
 
-    return losses.avg
+# === Main Script ===
+def main():
+    subject_list = ["s508", "s514", "s515", "s517", "s519", "s520", "s521", "s523"]
+    data_save_dir = r"F:\comp_project\Off_tensor_Data_R"
+    model_save_dir = r"F:\comp_project\shared_ae_models"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# checkpoint1 = torch.load(modelpath+'cl/models/'+'pose_less_'+str(batch_size)+'_seed'+str(param[jobid][2])+'_model/'+'ckpt_epoch_10.pth')##30,10
-# checkpoint2 = torch.load(modelpath+'cl/models/neural_'+str(batch_size)+'_seed'+str(param[jobid][2])+'/'+'ckpt_epoch_10.pth')
+    for subj in subject_list:
+        print(f"\n🚀 Processing subject {subj}...")
 
+        # Load tensors
+        save_dir = os.path.join(data_save_dir, subj)
+        gpi = torch.load(os.path.join(save_dir, "gpi_train_off.pt"))  # [N, W, C]
+        stn = torch.load(os.path.join(save_dir, "stn_train_off.pt"))  # [N, W, C]
 
-# model_image.load_state_dict(checkpoint1['model'], strict=False)
-# model_neural.load_state_dict(checkpoint2['model'], strict=False)
-# optimizer_image.load_state_dict(checkpoint1['optimizer'])
-# optimizer_neural.load_state_dict(checkpoint2['optimizer'])
+        # Truncate to first 244 time points
+        gpi = gpi[:, :244, :]  # shape: [N, 244, C]
+        stn = stn[:, :244, :]  # shape: [N, 244, C]
+        print(f"✅ Loaded: {gpi.shape}, {stn.shape}")
 
-for param in model_image.parameters():
-    param.requires_grad = True
-for param in model_neural.parameters():
-    param.requires_grad = True
+        # Reshape to [N, C, W]
+        gpi = gpi.permute(0, 2, 1)
+        stn = stn.permute(0, 2, 1)
+        W = gpi.shape[-1]
+        newW = W - 2
 
-for epoch in range(1, epochs + 1):
-    # adjust_learning_rate(opt, optimizer, epoch) ###later
+        # transform = TwoDropTransform_twomodal(W, newW)
+        dataset = GpiStnDataset(gpi, stn, transform=None)
+        loader = DataLoader(dataset, batch_size=8, shuffle=True) #default was 64
 
-    # train for one epoch
-    time1 = time.time()
-    loss = train(loader, model_image,model_neural,model_decoder,mse_criterion, optimizer, epoch,epochs,warm,warm_epochs,warmup_from,warmup_to,optimizer_image,optimizer_neural)
-    time2 = time.time()
-    print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
+        # Define models
+        model_gpi = SupConClipResNet1d(in_channel=gpi.shape[1], name1='resnet18', name2='resnet18', flag='neural', feat_dim=8).to(device) #I think this needs to change to 10
+        model_stn = SupConClipResNet1d(in_channel=stn.shape[1], name1='resnet18', name2='resnet18', flag='neural', feat_dim=8).to(device)
 
+        model_decoder = Decoder_dualNeuro(
+            embedding_dim=8, # from encoder output
+            channels=newW, # time dimension
+            bottleneck_dim=8, # smaller internal representation
+            image_latent_dim=3, #shared_GPi latent
+            neural_latent_dim=3, #shared STN latent
+            image_dim=gpi.shape[1], #GPi output channels
+            neural_dim=stn.shape[1], #STN output channels
+            image_private_dim=5, # GPi private
+            neural_private_dim=5 #STN private
+        ).to(device)
 
-    if epoch % save_freq == 0:
-        save_file1 = os.path.join(save_folder1, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
-        save_file2 = os.path.join(save_folder2, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
-        save_file3 = os.path.join(save_folderdecoder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
-        
-        
-        save_model(model_image, optimizer_image, epoch, save_file1)
-        save_model(model_neural, optimizer_neural, epoch, save_file2)
-        save_model(model_decoder, optimizer, epoch, save_file3)
-        
-        
+        # Define losses and optimizers
+        mse_criterion = nn.MSELoss().to(device)
+        optimizer_gpi = optim.Adam(model_gpi.parameters(), lr=1e-4)
+        optimizer_stn = optim.Adam(model_stn.parameters(), lr=1e-4)
+        optimizer_decoder = optim.Adam(model_decoder.parameters(), lr=1e-4)
 
-# save the last model
-save_file1 = os.path.join(save_folder1, 'last.pth')
-save_file2 = os.path.join(save_folder2, 'last.pth')
-save_file3 = os.path.join(save_folder3, 'last.pth')
+        # Train
+        for epoch in range(1, 101):
+            print(f"📚 Epoch {epoch}")
+            train(loader, model_gpi, model_stn, model_decoder, mse_criterion,
+                  optimizer_decoder, optimizer_gpi, optimizer_stn, epoch, device)
 
+        # Save
+        save_dir_model = os.path.join(model_save_dir, subj)
+        os.makedirs(save_dir_model, exist_ok=True)
+        save_model(model_gpi, optimizer_gpi, epoch, os.path.join(save_dir_model, "gpi_encoder.pth"))
+        save_model(model_stn, optimizer_stn, epoch, os.path.join(save_dir_model, "stn_encoder.pth"))
+        save_model(model_decoder, optimizer_decoder, epoch, os.path.join(save_dir_model, "decoder.pth"))
 
-save_model(model_image, optimizer_image, epochs, save_file1)
-save_model(model_neural, optimizer_neural, epoch, save_file2)
-save_model(model_decoder, optimizer_decoder, epoch, save_file3)
+        print(f"✅ Finished training and saving model for {subj}.")
 
+if __name__ == "__main__":
+    main()

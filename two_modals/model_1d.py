@@ -183,7 +183,11 @@ class LinearBatchNorm(nn.Module):
 
 #we need to initialize cross_domain model
 class SupConClipResNet1d(nn.Module):
-    """backbone + projection head"""
+    """backbone + projection head
+    1d conv over time
+    input: N,C,T
+    output: N,D
+    """
     def __init__(self, in_channel=3, name1='resnet50', name2='neural_resnet18',head='mlp', feat_dim=512,flag='image'):
         super(SupConClipResNet1d, self).__init__()
 
@@ -233,7 +237,7 @@ class SupConClipResNet1d(nn.Module):
                 'head not supported: {}'.format(head))
 
     def forward(self, input_):
-        if self.flag=='image' or 'cifar':
+        if self.flag in ['image', 'cifar']:
             # neural=self.neuralencoder(neural)
             image=self.imgencoder(input_)
             # flow=self.flowencoder(flow)
