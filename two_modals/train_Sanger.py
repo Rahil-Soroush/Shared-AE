@@ -2,7 +2,7 @@ import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 from model_1d import SupConClipResNet1d
-from modeldecodeorth1 import Decoder, Decoder_dualNeuro
+from modeldecodeorth1 import  Decoder_dualNeuro
 from multi_loss import SupConLoss, csLoss
 from util import AverageMeter, save_model, TwoDropTransform_twomodal
 import torch.nn as nn
@@ -67,8 +67,10 @@ def train(loader, model_gpi, model_stn, model_decoder, mse_criterion,cs_criterio
 
         # Final loss with weights
         weight3 = 1.0      # shared/shared alignment
-        weight4 = 0.05     # private/private
-        weight5 = 0.05     # shared/private
+        # weight4 = 0.05     # private/private
+        # weight5 = 0.05     # shared/private
+        weight4 = 0.01     # private/private
+        weight5 = 0.01     # shared/private
 
         loss = (
             loss1 * gpi.shape[1] * gpi.shape[2] +   # N_channels * T
@@ -103,7 +105,7 @@ def train(loader, model_gpi, model_stn, model_decoder, mse_criterion,cs_criterio
         # writer.add_scalar("Loss/shared_gpi_private_inv_cs", loss5.item(), step)
         # writer.add_scalar("Loss/shared_stn_private_inv_cs", loss6.item(), step)
 
-        if batch_idx % 10 == 0:
+        if batch_idx % 20 == 0:
             print(f"  Batch {batch_idx}, Loss: {loss.item():.4f}")
 
     writer.add_scalar("Loss/total", total_loss_epoch / n_batches, epoch)
@@ -117,9 +119,10 @@ def train(loader, model_gpi, model_stn, model_decoder, mse_criterion,cs_criterio
 
 # === Main Script ===
 def main():
-    subject_list = ["s508", "s514", "s515", "s517", "s519", "s520", "s521", "s523"]
+    subject_list = ["s508", "s514", "s515", "s517", "s519", "s520", "s521", "s523"] #right
+    # subject_list = ["s508", "s513","s514", "s515","s518","s519","s520","s521","s523"]  # left side
     data_save_dir = r"F:\comp_project\Off_tensor_Data_R"
-    model_save_dir = r"F:\comp_project\shared_ae_models"
+    model_save_dir = r"F:\comp_project\shared_ae_models_R_8_01L"
     writer = SummaryWriter(log_dir=f"runs/sharedae_exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
