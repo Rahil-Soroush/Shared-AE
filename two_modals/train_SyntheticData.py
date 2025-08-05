@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
+import numpy as np
 
 # === Custom Dataset ===
 class GpiStnDataset(Dataset):
@@ -119,76 +120,80 @@ def train(loader, model_gpi, model_stn, model_decoder, mse_criterion,cs_criterio
 
 # === Main Script ===
 def main():
-    # subject_list = ["s508", "s514", "s515", "s517", "s519", "s520", "s521", "s523"] #right
-    # subject_list = ["s508", "s513","s514", "s515","s518","s519","s520","s521","s523"]  # left side
-    subject_list = ["s520","s521","s523"]  # remaining
-    data_save_dir = r"F:\comp_project\Off_tensor_Data_L"
-    model_save_dir = r"F:\comp_project\shared_ae_models_L_10_01L"
+
+    data_dir = r"F:\comp_project\synthecticData\data"
+    model_save_dir = r"F:\comp_project\synthecticData\SharedAE"
     writer = SummaryWriter(log_dir=f"runs/sharedae_exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    for subj in subject_list:
-        print(f"\n🚀 Processing subject {subj}...")
 
-        # Load tensors
-        save_dir = os.path.join(data_save_dir, subj)
-        gpi = torch.load(os.path.join(save_dir, "gpi_train_off.pt"))  # [N, W, C]
-        stn = torch.load(os.path.join(save_dir, "stn_train_off.pt"))  # [N, W, C]
+    print(f"\n🚀 Processing ")
 
-        # Truncate to first 244 time points
-        gpi = gpi[:, :244, :]  # shape: [N, 244, C]
-        stn = stn[:, :244, :]  # shape: [N, 244, C]
-        print(f"✅ Loaded: {gpi.shape}, {stn.shape}")
+    # Load tensors
+    # save_dir = os.path.join(data_save_dir, subj)
+    data = np.load(os.path.join(data_dir, "synth_data_v4_lin_noDelay_morePri_L250_fs500_s3p3.npz"))  # [N, W, C]
+    region1 = data['region1']           # shape: (n_trials, n_channels, T)
+    region2 = data['region2']           # shape: (n_trials, n_channels, T)
+    gt_shared = data['gt_shared']       # shape: (n_trials, shared_dim, T)
+    gt_shared1 = data['gt_shared1']     # shape: (n_trials, shared_dim, T)
+    gt_shared2 = data['gt_shared2']     # shape: (n_trials, shared_dim, T)
+    gt_private1 = data['gt_private1']   # shape: (n_trials, private_dim, T)
+    gt_private2 = data['gt_private2']   # shape: (n_trials, private_dim, T)
 
-        # Reshape to [N, C, W]
-        gpi = gpi.permute(0, 2, 1)
-        stn = stn.permute(0, 2, 1)
-        W = gpi.shape[-1]
-        newW = W - 2
+    # Truncate to first 244 time points
+    gpi = region1[:, :, :244]  # shape: [N, C, 244]
+    stn = region2[:, :, :244]  
+    print(f"✅ Loaded: {gpi.shape}, {stn.shape}")
 
-        # transform = TwoDropTransform_twomodal(W, newW)
-        dataset = GpiStnDataset(gpi, stn, transform=None)
-        loader = DataLoader(dataset, batch_size=8, shuffle=True) #default was 64
+    # Reshape to [N, C, W]
+    # gpi = gpi.permute(0, 2, 1)
+    # stn = stn.permute(0, 2, 1)
+    W = gpi.shape[-1]
+    newW = W - 2
 
-        # Define models
-        model_gpi = SupConClipResNet1d(in_channel=gpi.shape[1], name1='resnet18', name2='resnet18', flag='neural', feat_dim=10).to(device) #I think this needs to change to 10
-        model_stn = SupConClipResNet1d(in_channel=stn.shape[1], name1='resnet18', name2='resnet18', flag='neural', feat_dim=10).to(device)
+    # transform = TwoDropTransform_twomodal(W, newW)
+    dataset = GpiStnDataset(gpi, stn, transform=None)
+    loader = DataLoader(dataset, batch_size=8, shuffle=True) #default was 64
 
-        model_decoder = Decoder_dualNeuro(
-            embedding_dim=10, # from encoder output
-            channels=newW, # time dimension
-            bottleneck_dim=10, # smaller internal representation
-            image_latent_dim=5, #shared_GPi latent
-            neural_latent_dim=5, #shared STN latent
-            image_dim=gpi.shape[1], #GPi output channels
-            neural_dim=stn.shape[1], #STN output channels
-            image_private_dim=5, # GPi private
-            neural_private_dim=5 #STN private
-        ).to(device)
+    # Define models
+    model_gpi = SupConClipResNet1d(in_channel=gpi.shape[1], name1='resnet18', name2='resnet18', flag='neural', feat_dim=10).to(device) #I think this needs to change to 10
+    model_stn = SupConClipResNet1d(in_channel=stn.shape[1], name1='resnet18', name2='resnet18', flag='neural', feat_dim=10).to(device)
 
-        # Define losses and optimizers
-        mse_criterion = nn.MSELoss().to(device)
-        cs_criterion=csLoss(15).to(device)
+    model_decoder = Decoder_dualNeuro(
+        embedding_dim=10, # from encoder output
+        channels=newW, # time dimension
+        bottleneck_dim=10, # smaller internal representation
+        image_latent_dim=3, #shared_GPi latent
+        neural_latent_dim=3, #shared STN latent
+        image_dim=gpi.shape[1], #GPi output channels
+        neural_dim=stn.shape[1], #STN output channels
+        image_private_dim=3, # GPi private
+        neural_private_dim=3 #STN private
+    ).to(device)
 
-        optimizer_gpi = optim.Adam(model_gpi.parameters(), lr=1e-4)
-        optimizer_stn = optim.Adam(model_stn.parameters(), lr=1e-4)
-        optimizer_decoder = optim.Adam(model_decoder.parameters(), lr=1e-4)
+    # Define losses and optimizers
+    mse_criterion = nn.MSELoss().to(device)
+    cs_criterion=csLoss(15).to(device)
 
-        # Train
-        for epoch in range(1, 201):
-            print(f"📚 Epoch {epoch}")
-            train(loader, model_gpi, model_stn, model_decoder, mse_criterion,cs_criterion,
-                  optimizer_decoder, optimizer_gpi, optimizer_stn, epoch, device, writer)
+    optimizer_gpi = optim.Adam(model_gpi.parameters(), lr=1e-4)
+    optimizer_stn = optim.Adam(model_stn.parameters(), lr=1e-4)
+    optimizer_decoder = optim.Adam(model_decoder.parameters(), lr=1e-4)
 
-        writer.close()
-        # Save
-        save_dir_model = os.path.join(model_save_dir, subj)
-        os.makedirs(save_dir_model, exist_ok=True)
-        save_model(model_gpi, optimizer_gpi, epoch, os.path.join(save_dir_model, "gpi_encoder.pth"))
-        save_model(model_stn, optimizer_stn, epoch, os.path.join(save_dir_model, "stn_encoder.pth"))
-        save_model(model_decoder, optimizer_decoder, epoch, os.path.join(save_dir_model, "decoder.pth"))
+    # Train
+    for epoch in range(1, 201):
+        print(f"📚 Epoch {epoch}")
+        train(loader, model_gpi, model_stn, model_decoder, mse_criterion,cs_criterion,
+                optimizer_decoder, optimizer_gpi, optimizer_stn, epoch, device, writer)
 
-        print(f"✅ Finished training and saving model for {subj}.")
+    writer.close()
+    # Save
+    save_dir_model = os.path.join(model_save_dir, "synth_data_v4_lin_noDelay_morePri_L250_fs500_s3p3")
+    os.makedirs(save_dir_model, exist_ok=True)
+    save_model(model_gpi, optimizer_gpi, epoch, os.path.join(save_dir_model, "gpi_encoder.pth"))
+    save_model(model_stn, optimizer_stn, epoch, os.path.join(save_dir_model, "stn_encoder.pth"))
+    save_model(model_decoder, optimizer_decoder, epoch, os.path.join(save_dir_model, "decoder.pth"))
+
+    print(f"✅ Finished training and saving model.")
 
 if __name__ == "__main__":
     main()
